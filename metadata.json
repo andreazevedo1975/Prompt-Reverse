@@ -1,0 +1,5 @@
+{
+  "name": "Prompt Reverse Engineer",
+  "description": "An application that analyzes source code using the Gemini API to generate a structured, faithful prompt for other generative AI models. This allows for precise description, modification, or replication of the original code.",
+  "requestFramePermissions": []
+}
