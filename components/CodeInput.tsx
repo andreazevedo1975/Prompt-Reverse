@@ -1,3 +1,4 @@
+
 import React, { useRef, useState } from 'react';
 import { FolderUploadIcon, TrashIcon, FileUploadIcon, LinkIcon, GitBranchIcon, CheckIcon, WarningIcon } from './icons';
 import { Loader } from './Loader';
@@ -69,7 +70,6 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
     const validFiles: File[] = [];
     const skippedFiles: { name: string, reason: string }[] = [];
 
-    // FIX: Add explicit type `File` to the `file` parameter to resolve type inference issues.
     Array.from(files).forEach((file: File) => {
       const extension = file.name.split('.').pop()?.toLowerCase() || '';
       if (BLOCKED_EXTENSIONS.has(extension)) {
@@ -181,120 +181,194 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
     });
   };
 
+  // --- Repo Fetching Logic (GitHub, GitLab, Bitbucket) ---
+
+  const isBlockedExtension = (path: string) => {
+    const extension = path.split('.').pop()?.toLowerCase();
+    return extension ? BLOCKED_EXTENSIONS.has(extension) : false;
+  };
+
+  const fetchGitHub = async (repoPath: string): Promise<UploadedFile[]> => {
+    const RATE_LIMIT_ERROR_MESSAGE = "Limite de requisições da API do GitHub atingido. Aguarde ou tente mais tarde.";
+    
+    setRepoFetchState(prev => ({...prev, message: "Buscando informações do repositório GitHub..."}));
+    const repoInfoResponse = await fetch(`https://api.github.com/repos/${repoPath}`);
+    if (!repoInfoResponse.ok) {
+        if (repoInfoResponse.status === 403) throw new Error(RATE_LIMIT_ERROR_MESSAGE);
+        if (repoInfoResponse.status === 404) throw new Error("Repositório não encontrado. Verifique se é público.");
+        throw new Error(`Erro GitHub API: ${repoInfoResponse.status}`);
+    }
+    const repoInfo = await repoInfoResponse.json();
+    const defaultBranch = repoInfo.default_branch;
+
+    setRepoFetchState(prev => ({...prev, message: "Mapeando arquivos..."}));
+    const treeResponse = await fetch(`https://api.github.com/repos/${repoPath}/git/trees/${defaultBranch}?recursive=1`);
+    if (!treeResponse.ok) throw new Error("Falha ao buscar árvore de arquivos.");
+    const treeData = await treeResponse.json();
+
+    if (treeData.truncated) console.warn("Árvore de arquivos muito grande (truncada).");
+
+    const filesToFetch = treeData.tree
+        .filter((node: any) => node.type === 'blob' && !isBlockedExtension(node.path))
+        .filter((node: any) => !/(^|[\/\\])(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i.test(node.path))
+        .slice(0, 60); // Limit files
+
+    const allFiles: UploadedFile[] = [];
+    for (let i = 0; i < filesToFetch.length; i++) {
+        const file = filesToFetch[i];
+        setRepoFetchState(prev => ({...prev, message: `Baixando ${i + 1}/${filesToFetch.length}: ${file.path}` }));
+        
+        const fileResponse = await fetch(file.url);
+        if (!fileResponse.ok) continue;
+        const blob = await fileResponse.json();
+        if(blob.size > MAX_FILE_SIZE_BYTES) continue;
+        
+        allFiles.push({ path: file.path, content: base64ToUtf8(blob.content) });
+        await new Promise(r => setTimeout(r, 50)); // Throttle
+    }
+    return allFiles;
+  };
+
+  const fetchGitLab = async (repoPath: string): Promise<UploadedFile[]> => {
+    // GitLab API requires URL encoded project path (namespace/project)
+    const encodedPath = encodeURIComponent(repoPath);
+    
+    setRepoFetchState(prev => ({...prev, message: "Buscando informações do projeto GitLab..."}));
+    
+    // 1. Get Project Info for Default Branch
+    const projectResponse = await fetch(`https://gitlab.com/api/v4/projects/${encodedPath}`);
+    if (!projectResponse.ok) {
+        if (projectResponse.status === 404) throw new Error("Projeto GitLab não encontrado ou privado.");
+        throw new Error(`Erro GitLab API (Info): ${projectResponse.status}`);
+    }
+    const projectData = await projectResponse.json();
+    const defaultBranch = projectData.default_branch || 'main';
+
+    setRepoFetchState(prev => ({...prev, message: `Buscando árvore de arquivos (${defaultBranch})...`}));
+    
+    // 2. Get File Tree
+    const treeResponse = await fetch(`https://gitlab.com/api/v4/projects/${encodedPath}/repository/tree?recursive=true&per_page=60&ref=${defaultBranch}`);
+    if (!treeResponse.ok) {
+       throw new Error(`Erro GitLab API (Tree): ${treeResponse.status}`);
+    }
+    const treeData = await treeResponse.json();
+    
+    const filesToFetch = treeData
+      .filter((node: any) => node.type === 'blob' && !isBlockedExtension(node.path))
+      .filter((node: any) => !/(^|[\/\\])(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i.test(node.path))
+      .slice(0, 60);
+
+    const allFiles: UploadedFile[] = [];
+    for (let i = 0; i < filesToFetch.length; i++) {
+      const file = filesToFetch[i];
+      setRepoFetchState(prev => ({...prev, message: `Baixando ${i + 1}/${filesToFetch.length}: ${file.path}` }));
+      
+      const encodedFilePath = encodeURIComponent(file.path);
+      const fileResponse = await fetch(`https://gitlab.com/api/v4/projects/${encodedPath}/repository/files/${encodedFilePath}/raw?ref=${defaultBranch}`);
+      
+      if (!fileResponse.ok) continue;
+      
+      const text = await fileResponse.text();
+      allFiles.push({ path: file.path, content: text });
+      await new Promise(r => setTimeout(r, 50));
+    }
+    return allFiles;
+  };
+
+  const fetchBitbucket = async (repoPath: string): Promise<UploadedFile[]> => {
+    // Bitbucket format: workspace/repo_slug
+    setRepoFetchState(prev => ({...prev, message: "Conectando ao Bitbucket..."}));
+    
+    const baseUrl = `https://api.bitbucket.org/2.0/repositories/${repoPath}/src`;
+    const allFiles: UploadedFile[] = [];
+    
+    // Recursive crawler for Bitbucket
+    const crawl = async (url: string, depth: number = 0) => {
+      if (depth > 4 || allFiles.length >= 40) return; // Safety limits
+      
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const data = await res.json();
+      
+      if (data.values) {
+        for (const entry of data.values) {
+           if (allFiles.length >= 40) break;
+           
+           if (entry.type === 'commit_file' && !isBlockedExtension(entry.path)) {
+              setRepoFetchState(prev => ({...prev, message: `Baixando: ${entry.path}` }));
+              // We use allorigins proxy to bypass potential CORS issues with raw content
+              try {
+                 const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(entry.links.self.href)}`;
+                 const fileRes = await fetch(proxyUrl);
+                 if (fileRes.ok) {
+                   const content = await fileRes.text();
+                   allFiles.push({ path: entry.path, content });
+                 }
+              } catch (e) { console.warn("Bitbucket file fetch failed", e); }
+           } else if (entry.type === 'commit_directory') {
+              await crawl(entry.links.self.href, depth + 1);
+           }
+        }
+      }
+    };
+
+    // Start crawling from HEAD
+    await crawl(`${baseUrl}/HEAD/`);
+    if (allFiles.length === 0) throw new Error("Nenhum arquivo acessível encontrado ou erro de CORS no Bitbucket.");
+    return allFiles;
+  };
+
   const handleFetchFromRepo = async () => {
     setUploadWarning(null);
-    const RATE_LIMIT_ERROR_MESSAGE = "Limite de requisições da API do GitHub atingido. Para evitar sobrecarga, o GitHub limita o número de solicitações anônimas. Por favor, aguarde um pouco (o bloqueio pode durar até uma hora) antes de tentar novamente. Isso não é um erro do aplicativo.";
 
     if (!repoUrl) {
-        setRepoFetchState({ loading: false, error: "Por favor, insira a URL de um repositório GitHub.", success: false, message: null });
+        setRepoFetchState({ loading: false, error: "Insira a URL do repositório.", success: false, message: null });
         return;
     }
 
-    setRepoFetchState({ loading: true, error: null, success: null, message: "Analisando a URL do repositório..." });
-
-    let repoPath: string;
-    try {
-      const urlToParse = repoUrl.startsWith('http') ? repoUrl : `https://${repoUrl}`;
-      const url = new URL(urlToParse);
-      
-      if (url.hostname !== 'github.com' && url.hostname !== 'www.github.com') {
-         throw new Error("Apenas repositórios do github.com são suportados.");
-      }
-      
-      const pathParts = url.pathname.split('/').filter(p => p);
-      if (pathParts.length < 2) {
-        throw new Error("Não foi possível extrair o 'usuário/repositório' da URL.");
-      }
-      
-      repoPath = `${pathParts[0]}/${pathParts[1]}`.replace(/\.git$/, '');
-    } catch (e: any) {
-      setRepoFetchState({ loading: false, error: `URL inválida. ${e.message}. Por favor, use o formato https://github.com/usuario/repositorio.`, success: false, message: null });
-      return;
-    }
+    setRepoFetchState({ loading: true, error: null, success: null, message: "Identificando provedor..." });
 
     try {
-        setRepoFetchState(prev => ({...prev, message: "Buscando informações do repositório..."}));
-        const repoInfoResponse = await fetch(`https://api.github.com/repos/${repoPath}`);
-        if (!repoInfoResponse.ok) {
-            if (repoInfoResponse.status === 403) {
-              throw new Error(RATE_LIMIT_ERROR_MESSAGE);
-            }
-            if (repoInfoResponse.status === 404) {
-                 throw new Error("Repositório não encontrado (erro 404). Verifique se a URL está correta e se o repositório é público.");
-            }
-            throw new Error(`Não foi possível carregar informações do repositório. Status: ${repoInfoResponse.status}`);
-        }
-        const repoInfo = await repoInfoResponse.json();
-        const defaultBranch = repoInfo.default_branch;
+      let urlObj: URL;
+      try {
+         urlObj = new URL(repoUrl.startsWith('http') ? repoUrl : `https://${repoUrl}`);
+      } catch {
+         throw new Error("URL inválida.");
+      }
+      
+      const hostname = urlObj.hostname.toLowerCase();
+      const pathParts = urlObj.pathname.split('/').filter(Boolean);
+      
+      if (pathParts.length < 2) throw new Error("URL deve conter usuário/repositório.");
+      const repoPath = `${pathParts[0]}/${pathParts[1]}`.replace(/\.git$/, '');
 
-        setRepoFetchState(prev => ({...prev, message: "Buscando lista de arquivos..."}));
-        const treeResponse = await fetch(`https://api.github.com/repos/${repoPath}/git/trees/${defaultBranch}?recursive=1`);
-        if (!treeResponse.ok) {
-            if (treeResponse.status === 403) {
-              throw new Error(RATE_LIMIT_ERROR_MESSAGE);
-            }
-            throw new Error(`Não foi possível carregar a árvore de arquivos. Status: ${treeResponse.status}`);
-        }
-        const treeData = await treeResponse.json();
+      let fetchedFiles: UploadedFile[] = [];
 
-        if (treeData.truncated) {
-            console.warn("A árvore de arquivos do repositório é muito grande e foi truncada. Apenas uma parte dos arquivos será analisada.");
-        }
-        
-        const isBlockedExtension = (path: string) => {
-          const extension = path.split('.').pop()?.toLowerCase();
-          return extension ? BLOCKED_EXTENSIONS.has(extension) : false;
-        };
+      if (hostname.includes('github.com')) {
+        fetchedFiles = await fetchGitHub(repoPath);
+      } else if (hostname.includes('gitlab.com')) {
+        fetchedFiles = await fetchGitLab(repoPath);
+      } else if (hostname.includes('bitbucket.org')) {
+        fetchedFiles = await fetchBitbucket(repoPath);
+      } else {
+        throw new Error("Provedor não suportado. Use GitHub, GitLab ou Bitbucket.");
+      }
 
-        const filesToFetch = treeData.tree
-            .filter((node: any) => node.type === 'blob' && !isBlockedExtension(node.path))
-            .filter((node: any) => !/(^|[\/\\])(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i.test(node.path))
-            .slice(0, 100); // Increased limit slightly
+      if (fetchedFiles.length === 0) {
+        throw new Error("Nenhum arquivo de código válido encontrado.");
+      }
 
-        const allFiles: UploadedFile[] = [];
-        for (let i = 0; i < filesToFetch.length; i++) {
-            const file = filesToFetch[i];
-            const progressMessage = `Baixando arquivo ${i + 1} de ${filesToFetch.length}: ${file.path}`;
-            setRepoFetchState(prev => ({...prev, message: progressMessage }));
-
-            const fileResponse = await fetch(file.url);
-            
-            if (fileResponse.status === 403) {
-                 throw new Error(RATE_LIMIT_ERROR_MESSAGE);
-            }
-
-            if (!fileResponse.ok) {
-                console.warn(`Não foi possível buscar o arquivo ${file.path}. Status: ${fileResponse.status}. Pulando.`);
-                continue;
-            }
-
-            const blob = await fileResponse.json();
-            if(blob.size > MAX_FILE_SIZE_BYTES) {
-                 console.warn(`Arquivo ${file.path} excedeu o limite de tamanho e foi ignorado.`);
-                 continue;
-            }
-
-            const content = base64ToUtf8(blob.content);
-            allFiles.push({ path: file.path, content });
-            
-            await new Promise(resolve => setTimeout(resolve, 50));
-        }
-        
-        if (allFiles.length === 0) {
-             throw new Error("Nenhum arquivo de código-fonte compatível foi encontrado no repositório, ou os arquivos não puderam ser buscados.");
-        }
-
-        setUploadedFiles(allFiles);
-        setRepoUrl('');
-        setRepoFetchState({ loading: false, error: null, success: true, message: `${allFiles.length} arquivo(s) carregado(s) com sucesso!` });
-        
-        setTimeout(() => {
-          setRepoFetchState(prev => ({ ...prev, success: null, message: null }));
-        }, 4000);
+      setUploadedFiles(fetchedFiles);
+      setRepoUrl('');
+      setRepoFetchState({ loading: false, error: null, success: true, message: `${fetchedFiles.length} arquivo(s) importado(s)!` });
+      
+      setTimeout(() => {
+        setRepoFetchState(prev => ({ ...prev, success: null, message: null }));
+      }, 4000);
 
     } catch (error: any) {
-        console.error("Erro ao buscar do repositório:", error);
-        setRepoFetchState({ loading: false, error: `Falha ao carregar o repositório. ${error.message}`, success: false, message: null });
+        console.error("Repo Fetch Error:", error);
+        setRepoFetchState({ loading: false, error: error.message || "Erro ao clonar repositório.", success: false, message: null });
     }
   };
 
@@ -425,7 +499,7 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
       <div>
         <label htmlFor="repo-url-input" className="flex items-center text-sm font-medium text-gray-400 mb-2">
             <GitBranchIcon className="h-4 w-4 mr-2" />
-            Carregar de repositório Git (GitHub)
+            Carregar de Repositório (GitHub, GitLab, Bitbucket)
         </label>
         <div className="flex items-center space-x-2">
             <input
@@ -438,7 +512,7 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
                     setRepoFetchState({ loading: false, error: null, success: null, message: null });
                   }
                 }}
-                placeholder="Ex: https://github.com/usuario/repositorio"
+                placeholder="Ex: https://github.com/usuario/repo"
                 className="flex-grow p-3 font-sans text-sm bg-gray-800 text-gray-300 border border-gray-700 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500"
             />
             <button 
@@ -446,14 +520,14 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
                 disabled={repoFetchState.loading}
                 className="inline-flex items-center justify-center px-4 py-3 border border-transparent text-sm font-medium rounded-md text-white bg-gray-600 hover:bg-gray-500 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-blue-500 disabled:bg-gray-700 disabled:cursor-not-allowed transition-colors"
             >
-                {repoFetchState.loading ? <Loader size="sm" /> : 'Analisar'}
+                {repoFetchState.loading ? <Loader size="sm" /> : 'Clonar'}
             </button>
         </div>
         <div className="mt-2 text-xs min-h-[16px] transition-all duration-300">
           {repoFetchState.loading && (
               <div className="flex items-center text-gray-500">
                   <Loader size="sm" />
-                  <span className="ml-2 truncate">{repoFetchState.message || 'Analisando...'}</span>
+                  <span className="ml-2 truncate">{repoFetchState.message || 'Processando...'}</span>
               </div>
           )}
           {repoFetchState.error && (

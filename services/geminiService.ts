@@ -1,4 +1,5 @@
-import { GoogleGenAI, Type } from "@google/genai";
+
+import { GoogleGenAI, Type, Modality } from "@google/genai";
 import type { AnalysisResult } from '../types';
 
 if (!process.env.API_KEY) {
@@ -10,10 +11,10 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 const analysisSchema = {
   type: Type.OBJECT,
   properties: {
-    role: { type: Type.STRING, description: "O papel principal/persona para uma IA que analisa este código (ex: 'Desenvolvedor Sênior React')." },
-    languageFramework: { type: Type.STRING, description: "A linguagem principal e/ou framework (ex: 'JavaScript com React')." },
-    mainObjective: { type: Type.STRING, description: "Uma breve descrição do que o código implementa (ex: 'um componente de contador simples')." },
-    technicalPurpose: { type: Type.STRING, description: "O foco técnico principal (ex: 'gerenciar estado com React Hooks')." },
+    role: { type: Type.STRING, description: "O papel principal/persona para uma IA que analisa este código." },
+    languageFramework: { type: Type.STRING, description: "A linguagem principal e/ou framework." },
+    mainObjective: { type: Type.STRING, description: "Uma breve descrição do que o código implementa." },
+    technicalPurpose: { type: Type.STRING, description: "O foco técnico principal." },
     keyFeatures: {
       type: Type.ARRAY,
       items: { type: Type.STRING },
@@ -38,73 +39,174 @@ const analysisSchema = {
   required: ["role", "languageFramework", "mainObjective", "technicalPurpose", "keyFeatures", "structureClasses", "structureFunctions", "dependencies"]
 };
 
+export const analyzeCode = async (code: string, useDeepThinking: boolean = false): Promise<AnalysisResult> => {
+  const modelName = useDeepThinking ? 'gemini-3-pro-preview' : 'gemini-2.5-flash';
+  
+  const thinkingConfig = useDeepThinking ? {
+    thinkingConfig: { thinkingBudget: 32768 } // Max budget for Gemini 3 Pro
+  } : {};
 
-export const analyzeCode = async (code: string): Promise<AnalysisResult> => {
   const prompt = `
-    Você é um analista de código especialista e engenheiro de prompts. Sua tarefa é analisar o código-fonte de um projeto com múltiplos arquivos, fornecido abaixo, e gerar um objeto JSON estruturado que detalha suas características principais de forma holística. Este JSON será usado para gerar automaticamente um prompt detalhado para outra IA.
+    Você é um analista de código especialista.
+    Analise o código-fonte fornecido abaixo e gere um objeto JSON estruturado.
+    
+    ${useDeepThinking ? "Use sua capacidade avançada de raciocínio para entender arquiteturas complexas e intenções implícitas no código." : ""}
 
-    O projeto consiste nos seguintes arquivos:
+    Projeto:
     \`\`\`
-    ${code}
+    ${code.substring(0, 100000)} 
     \`\`\`
-
-    Com base na sua análise do projeto como um todo, foque na arquitetura geral, como os arquivos interagem e no objetivo principal do projeto. Forneça um objeto JSON com a estrutura definida. Seja conciso e preciso.
+    
+    Retorne APENAS o JSON válido correspondente ao schema solicitado.
   `;
 
-  let response;
   try {
-    response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+    const response = await ai.models.generateContent({
+      model: modelName,
       contents: prompt,
       config: {
         responseMimeType: "application/json",
         responseSchema: analysisSchema,
+        ...thinkingConfig
       },
     });
+
+    const jsonText = response.text.trim();
+    return JSON.parse(jsonText) as AnalysisResult;
   } catch (error: any) {
-    console.error("Gemini API call failed:", error);
-
-    if (error.message?.includes('API key not valid')) {
-       throw new Error("A chave da API do Gemini não é válida. Verifique suas credenciais.");
-    }
-    
-    let isNetworkOrServerError = false;
-    let detailedMessage = error.message;
-
-    // Check for common network/server error indicators in the raw string
-    if (error.message?.includes('xhr error') || error.message?.includes('500') || error.message?.includes('server error')) {
-        isNetworkOrServerError = true;
-    }
-
-    // Try to parse the message as JSON for more specific details
-    try {
-        const errorObj = JSON.parse(error.message);
-        if (errorObj.error) {
-            detailedMessage = errorObj.error.message || detailedMessage;
-            if (errorObj.error.code === 500 || errorObj.error.status === 'UNKNOWN' || errorObj.error.status === 'UNAVAILABLE') {
-                isNetworkOrServerError = true;
-            }
-        }
-    } catch(e) {
-        // Not a JSON string, we rely on the string check above.
-    }
-    
-    if (isNetworkOrServerError) {
-        throw new Error("Falha na comunicação com a API do Gemini. Isso pode ser um problema de rede ou um erro temporário do servidor. Verifique sua conexão com a internet, desative qualquer firewall ou bloqueador de anúncios e tente novamente em alguns instantes.");
-    }
-    
-    throw new Error(`Ocorreu um erro ao comunicar com a API do Gemini. Detalhes: ${detailedMessage}`);
+    console.error("Code Analysis failed:", error);
+    throw new Error(`Falha na análise do código: ${error.message}`);
   }
+};
+
+export const researchContext = async (dependencies: string[]): Promise<{ title: string, url: string }[]> => {
+  if (!dependencies || dependencies.length === 0) return [];
   
-  const jsonText = response.text.trim();
-  if (!jsonText) {
-    throw new Error("A API do Gemini retornou uma resposta vazia. O código pode ser muito complexo ou a solicitação foi bloqueada.");
+  const query = `What are the latest official documentation links and purpose for these libraries: ${dependencies.slice(0, 5).join(', ')}?`;
+  
+  try {
+    // Google Search Grounding (must use standard model, not thinking model for tools)
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: query,
+      config: {
+        tools: [{ googleSearch: {} }],
+      },
+    });
+
+    // Extract grounding chunks
+    const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks;
+    if (chunks) {
+      return chunks
+        .filter((c: any) => c.web?.uri && c.web?.title)
+        .map((c: any) => ({ title: c.web.title, url: c.web.uri }));
+    }
+    return [];
+  } catch (e) {
+    console.warn("Search grounding failed", e);
+    return [];
   }
+};
+
+export const refinePrompt = async (originalPrompt: string, instructions: string): Promise<string> => {
+  const prompt = `
+    Refine este prompt de engenharia reversa com base no feedback: "${instructions}".
+    
+    Prompt Original:
+    ${originalPrompt}
+    
+    Retorne apenas o novo prompt.
+  `;
 
   try {
-    return JSON.parse(jsonText) as AnalysisResult;
-  } catch (e) {
-    console.error("Failed to parse Gemini's JSON response:", jsonText);
-    throw new Error("A resposta da API não era um JSON válido. A IA pode ter retornado um formato inesperado.");
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+    });
+    return response.text.trim();
+  } catch (error: any) {
+    throw new Error("Falha ao refinar prompt: " + error.message);
+  }
+};
+
+// --- Creative Tools ---
+
+export const generateProjectLogo = async (description: string): Promise<string> => {
+  try {
+    const prompt = `A modern, high-quality tech logo for a software project described as: ${description}. Minimalist, vector art style, professional, on a dark background.`;
+    
+    const response = await ai.models.generateImages({
+      model: 'imagen-4.0-generate-001',
+      prompt: prompt,
+      config: {
+        numberOfImages: 1,
+        aspectRatio: '1:1',
+        outputMimeType: 'image/jpeg'
+      },
+    });
+
+    const base64Image = response.generatedImages[0].image.imageBytes;
+    return `data:image/jpeg;base64,${base64Image}`;
+  } catch (error: any) {
+    console.error("Imagen failed:", error);
+    throw new Error("Falha na geração de imagem: " + error.message);
+  }
+};
+
+export const generateAudioSummary = async (text: string): Promise<string> => {
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash-preview-tts",
+      contents: [{ parts: [{ text: `Aqui está o resumo do seu projeto: ${text}` }] }],
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Kore' },
+          },
+        },
+      },
+    });
+
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (!base64Audio) throw new Error("Áudio não gerado.");
+    
+    return `data:audio/wav;base64,${base64Audio}`;
+  } catch (error: any) {
+    console.error("TTS failed:", error);
+    throw new Error("Falha na geração de áudio: " + error.message);
+  }
+};
+
+export const generateVideoPitch = async (description: string): Promise<string> => {
+  try {
+    // Veo generation
+    // Using fast-generate for responsiveness
+    let operation = await ai.models.generateVideos({
+      model: 'veo-3.1-fast-generate-preview',
+      prompt: `A cinematic abstract technology background video representing: ${description}. High tech, futuristic, glowing lines, 4k render.`,
+      config: {
+        numberOfVideos: 1,
+        resolution: '720p',
+        aspectRatio: '16:9'
+      }
+    });
+
+    // Polling loop
+    while (!operation.done) {
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5s
+      operation = await ai.operations.getVideosOperation({ operation: operation });
+    }
+
+    const videoUri = operation.response?.generatedVideos?.[0]?.video?.uri;
+    if (!videoUri) throw new Error("URI do vídeo não encontrado.");
+
+    // Fetch the actual bytes using the key
+    const videoUrlWithKey = `${videoUri}&key=${process.env.API_KEY}`;
+    return videoUrlWithKey;
+
+  } catch (error: any) {
+    console.error("Veo failed:", error);
+    throw new Error("Falha na geração de vídeo: " + error.message);
   }
 };
