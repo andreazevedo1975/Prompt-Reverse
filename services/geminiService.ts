@@ -63,10 +63,37 @@ export const analyzeCode = async (code: string): Promise<AnalysisResult> => {
     });
   } catch (error: any) {
     console.error("Gemini API call failed:", error);
-    if (error.message.includes('API key not valid')) {
+
+    if (error.message?.includes('API key not valid')) {
        throw new Error("A chave da API do Gemini não é válida. Verifique suas credenciais.");
     }
-    throw new Error(`Ocorreu um erro ao comunicar com a API do Gemini. Detalhes: ${error.message}`);
+    
+    let isNetworkOrServerError = false;
+    let detailedMessage = error.message;
+
+    // Check for common network/server error indicators in the raw string
+    if (error.message?.includes('xhr error') || error.message?.includes('500') || error.message?.includes('server error')) {
+        isNetworkOrServerError = true;
+    }
+
+    // Try to parse the message as JSON for more specific details
+    try {
+        const errorObj = JSON.parse(error.message);
+        if (errorObj.error) {
+            detailedMessage = errorObj.error.message || detailedMessage;
+            if (errorObj.error.code === 500 || errorObj.error.status === 'UNKNOWN' || errorObj.error.status === 'UNAVAILABLE') {
+                isNetworkOrServerError = true;
+            }
+        }
+    } catch(e) {
+        // Not a JSON string, we rely on the string check above.
+    }
+    
+    if (isNetworkOrServerError) {
+        throw new Error("Falha na comunicação com a API do Gemini. Isso pode ser um problema de rede ou um erro temporário do servidor. Verifique sua conexão com a internet, desative qualquer firewall ou bloqueador de anúncios e tente novamente em alguns instantes.");
+    }
+    
+    throw new Error(`Ocorreu um erro ao comunicar com a API do Gemini. Detalhes: ${detailedMessage}`);
   }
   
   const jsonText = response.text.trim();

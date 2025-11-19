@@ -6,7 +6,7 @@ import { Loader } from './components/Loader';
 import { analyzeCode } from './services/geminiService';
 import type { AnalysisResult, UploadedFile } from './types';
 
-type PromptStyle = 'technical' | 'popular';
+type PromptStyle = 'technical' | 'popular' | 'lovable';
 
 const formatTechnicalPrompt = (analysis: AnalysisResult, originalCode: string, task: string): string => {
   const {
@@ -85,6 +85,59 @@ ${originalCode}
   return prompt.trim();
 };
 
+const formatLovableBase44Prompt = (analysis: AnalysisResult, originalCode: string, task: string): string => {
+  const {
+    languageFramework,
+    mainObjective,
+    technicalPurpose,
+    keyFeatures,
+    structureClasses,
+    structureFunctions,
+    dependencies,
+  } = analysis;
+
+  const language = languageFramework.split(' ')[0]?.toLowerCase() || 'text';
+
+  let prompt = `@@BEGIN_PROMPT_TRANSMISSION
+@@FORMAT: Lovable/Base44
+@@RECIPIENT: CreativeAI_Companion
+
+@@CONTEXT_HEADER: Olá! Aqui está um resumo de um código bem legal!
+
+@@OBJECTIVE: ${mainObjective}
+
+@@DEEP_DIVE_PURPOSE: Tecnicamente falando, o foco é ${technicalPurpose}.
+
+@@CORE_TECH: Esta pequena maravilha foi construída com ${languageFramework}.
+
+@@SUPERPOWERS:
+${keyFeatures.map(f => `# ${f}`).join('\n')}
+
+@@BLUEPRINT:
+## Componentes Principais (os grandes blocos de construção):
+${structureClasses.length > 0 ? structureClasses.map(c => `- ${c}`).join('\n') : '- Nenhum identificado'}
+
+## Funções Principais (os feitiços mágicos):
+${structureFunctions.length > 0 ? structureFunctions.map(f => `- ${f}`).join('\n') : '- Nenhuma identificada'}
+
+## Ingredientes Secretos (dependências):
+${dependencies.length > 0 ? dependencies.map(d => `- ${d}`).join('\n') : '- Nenhuma identificada'}
+
+@@SOURCE_CODE_REFERENCE: A receita completa está aqui!
+\`\`\`${language}
+${originalCode}
+\`\`\`
+`;
+
+  if (task) {
+    prompt += `\n@@YOUR_MISSION:\nCom base no que você entendeu, execute esta missão: **${task}**`;
+  }
+
+  prompt += `\n\n@@END_PROMPT_TRANSMISSION`;
+
+  return prompt.trim();
+};
+
 
 const App: React.FC = () => {
   const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
@@ -101,8 +154,13 @@ const App: React.FC = () => {
   const displayedPrompt = useMemo(() => {
     if (!analysisResult) return '';
     
-    const formatFn = promptStyle === 'popular' ? formatPopularPrompt : formatTechnicalPrompt;
-    return formatFn(analysisResult, combinedCode, additionalTask);
+    const formatters: Record<PromptStyle, (analysis: AnalysisResult, originalCode: string, task: string) => string> = {
+      technical: formatTechnicalPrompt,
+      popular: formatPopularPrompt,
+      lovable: formatLovableBase44Prompt,
+    };
+    
+    return formatters[promptStyle](analysisResult, combinedCode, additionalTask);
 
   }, [analysisResult, promptStyle, additionalTask, combinedCode]);
 

@@ -1,5 +1,5 @@
 import React, { useRef, useState } from 'react';
-import { FolderUploadIcon, TrashIcon, FileUploadIcon, LinkIcon, GitBranchIcon, CheckIcon } from './icons';
+import { FolderUploadIcon, TrashIcon, FileUploadIcon, LinkIcon, GitBranchIcon, CheckIcon, WarningIcon } from './icons';
 import { Loader } from './Loader';
 import type { UploadedFile } from '../types';
 
@@ -17,6 +17,28 @@ interface RepoFetchState {
   message: string | null;
 }
 
+const MAX_FILE_SIZE_MB = 5;
+const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+const BLOCKED_EXTENSIONS = new Set([
+  // Images
+  'png', 'jpg', 'jpeg', 'gif', 'bmp', 'svg', 'webp', 'ico', 'tif', 'tiff',
+  // Documents
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
+  // Archives
+  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz',
+  // Audio
+  'mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a',
+  // Video
+  'mp4', 'avi', 'mov', 'wmv', 'mkv', 'flv', 'webm',
+  // Executables & binaries
+  'exe', 'dll', 'so', 'dmg', 'bin', 'o', 'a',
+  // Fonts
+  'woff', 'woff2', 'ttf', 'eot', 'otf',
+  // Other
+  'lock', 'log', 'DS_Store',
+]);
+
+
 export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploadedFiles, additionalTask, setAdditionalTask }) => {
   const folderInputRef = useRef<HTMLInputElement>(null);
   const singleFileInputRef = useRef<HTMLInputElement>(null);
@@ -24,6 +46,7 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
   const [urlFetchState, setUrlFetchState] = useState<{ loading: boolean; error: string | null }>({ loading: false, error: null });
   const [repoUrl, setRepoUrl] = useState('');
   const [repoFetchState, setRepoFetchState] = useState<RepoFetchState>({ loading: false, error: null, success: null, message: null });
+  const [uploadWarning, setUploadWarning] = useState<string | null>(null);
 
   const base64ToUtf8 = (base64: string) => {
     const binaryString = atob(base64);
@@ -41,8 +64,34 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
     if (!files || files.length === 0) {
       return;
     }
+    setUploadWarning(null);
 
-    const filePromises = Array.from(files).map((file: File) => {
+    const validFiles: File[] = [];
+    const skippedFiles: { name: string, reason: string }[] = [];
+
+    // FIX: Add explicit type `File` to the `file` parameter to resolve type inference issues.
+    Array.from(files).forEach((file: File) => {
+      const extension = file.name.split('.').pop()?.toLowerCase() || '';
+      if (BLOCKED_EXTENSIONS.has(extension)) {
+        skippedFiles.push({ name: file.name, reason: 'tipo de arquivo binário' });
+      } else if (file.size > MAX_FILE_SIZE_BYTES) {
+        skippedFiles.push({ name: file.name, reason: `tamanho excede ${MAX_FILE_SIZE_MB}MB` });
+      } else {
+        validFiles.push(file);
+      }
+    });
+
+    if (skippedFiles.length > 0) {
+        const skippedFileNames = skippedFiles.map(f => `"${f.name}" (${f.reason})`).join(', ');
+        setUploadWarning(`Arquivos ignorados: ${skippedFileNames}. Apenas arquivos de código-fonte baseados em texto e com menos de ${MAX_FILE_SIZE_MB}MB são suportados.`);
+    }
+
+    if (validFiles.length === 0) {
+        if (event.target) event.target.value = '';
+        return;
+    }
+
+    const filePromises = validFiles.map((file: File) => {
       return new Promise<UploadedFile>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (e) => {
@@ -65,6 +114,7 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
       setUploadedFiles(allFiles);
     } catch (error) {
       console.error("Erro ao processar arquivos:", error);
+      setUploadWarning(error instanceof Error ? error.message : "Ocorreu um erro desconhecido ao processar os arquivos.");
     }
 
     if (event.target) {
@@ -74,6 +124,7 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
   
   const handleFetchFromUrl = async () => {
     const urlsToFetch = url.split('\n').map(u => u.trim()).filter(Boolean);
+    setUploadWarning(null);
 
     if (urlsToFetch.length === 0) {
       setUrlFetchState({ loading: false, error: "Por favor, insira uma ou mais URLs." });
@@ -131,6 +182,7 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
   };
 
   const handleFetchFromRepo = async () => {
+    setUploadWarning(null);
     const RATE_LIMIT_ERROR_MESSAGE = "Limite de requisições da API do GitHub atingido. Para evitar sobrecarga, o GitHub limita o número de solicitações anônimas. Por favor, aguarde um pouco (o bloqueio pode durar até uma hora) antes de tentar novamente. Isso não é um erro do aplicativo.";
 
     if (!repoUrl) {
@@ -189,10 +241,15 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
             console.warn("A árvore de arquivos do repositório é muito grande e foi truncada. Apenas uma parte dos arquivos será analisada.");
         }
         
+        const isBlockedExtension = (path: string) => {
+          const extension = path.split('.').pop()?.toLowerCase();
+          return extension ? BLOCKED_EXTENSIONS.has(extension) : false;
+        };
+
         const filesToFetch = treeData.tree
-            .filter((node: any) => node.type === 'blob')
-            .filter((node: any) => !/(\.(jpg|jpeg|png|gif|svg|ico|woff|woff2|ttf|eot)|package-lock\.json|yarn\.lock)$/i.test(node.path))
-            .slice(0, 50);
+            .filter((node: any) => node.type === 'blob' && !isBlockedExtension(node.path))
+            .filter((node: any) => !/(^|[\/\\])(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i.test(node.path))
+            .slice(0, 100); // Increased limit slightly
 
         const allFiles: UploadedFile[] = [];
         for (let i = 0; i < filesToFetch.length; i++) {
@@ -212,6 +269,11 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
             }
 
             const blob = await fileResponse.json();
+            if(blob.size > MAX_FILE_SIZE_BYTES) {
+                 console.warn(`Arquivo ${file.path} excedeu o limite de tamanho e foi ignorado.`);
+                 continue;
+            }
+
             const content = base64ToUtf8(blob.content);
             allFiles.push({ path: file.path, content });
             
@@ -247,9 +309,11 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
   
   const handleClearFiles = () => {
     setUploadedFiles([]);
+    setUploadWarning(null);
   };
 
   const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setUploadWarning(null);
     const newContent = e.target.value;
     if (uploadedFiles.length <= 1) {
         const path = uploadedFiles[0]?.path || 'pasted_code.txt';
@@ -327,6 +391,12 @@ export const CodeInput: React.FC<CodeInputProps> = ({ uploadedFiles, setUploaded
           placeholder="Faça upload, cole um trecho de código ou carregue de uma URL..."
           className="w-full h-80 p-4 font-mono text-sm bg-gray-800 text-gray-300 border border-gray-700 rounded-md shadow-sm focus:ring-blue-500 focus:border-blue-500 resize-y"
         />
+        {uploadWarning && (
+          <div className="mt-2 p-3 text-xs text-yellow-300 bg-yellow-900/50 border border-yellow-700/50 rounded-md flex items-start">
+            <WarningIcon className="h-4 w-4 mr-2 flex-shrink-0 mt-0.5" />
+            <span>{uploadWarning}</span>
+          </div>
+        )}
       </div>
        <div>
         <label htmlFor="url-input" className="flex items-center text-sm font-medium text-gray-400 mb-2">

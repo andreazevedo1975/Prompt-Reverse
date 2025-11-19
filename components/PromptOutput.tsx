@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ClipboardIcon, CheckIcon, DownloadIcon } from './icons';
 
-type PromptStyle = 'technical' | 'popular';
+type PromptStyle = 'technical' | 'popular' | 'lovable';
 
 interface PromptOutputProps {
   prompt: string;
@@ -102,8 +102,15 @@ export const PromptOutput: React.FC<PromptOutputProps> = ({ prompt, promptStyle,
               </button>
               <button
                 type="button"
+                onClick={() => setPromptStyle('lovable')}
+                className={`-ml-px px-3 py-2 text-xs font-medium ${promptStyle === 'lovable' ? 'bg-blue-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} border border-gray-600 focus:z-10 focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 transition-colors`}
+              >
+                Lovable, Base44
+              </button>
+              <button
+                type="button"
                 onClick={() => setPromptStyle('popular')}
-                className={`px-3 py-2 text-xs font-medium ${promptStyle === 'popular' ? 'bg-blue-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} rounded-r-md border-y border-r border-gray-600 focus:z-10 focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 transition-colors`}
+                className={`-ml-px px-3 py-2 text-xs font-medium ${promptStyle === 'popular' ? 'bg-blue-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} rounded-r-md border border-gray-600 focus:z-10 focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-800 focus:ring-blue-500 transition-colors`}
               >
                 Popular
               </button>
